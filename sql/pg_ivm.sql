@@ -469,6 +469,76 @@ DELETE FROM base_t WHERE v = 5;
 SELECT * FROM mv ORDER BY i;
 ROLLBACK;
 
+-- matching condition with and without NULL keys in the delta
+BEGIN;
+CREATE TABLE base_t (i int, j int, v int);
+INSERT INTO base_t VALUES (1, 1, 10), (1, 2, 20), (NULL, 1, 30), (1, NULL, 40), (NULL, NULL, 50);
+SELECT pgivm.create_immv('mv', 'SELECT i, j, sum(v) AS s, count(*) AS c FROM base_t GROUP BY i, j');
+-- no NULL keys in the delta, NULL groups stay unchanged
+INSERT INTO base_t VALUES (1, 1, 1), (1, 2, 2);
+SELECT * FROM mv ORDER BY i, j;
+-- only NULL keys in the delta
+INSERT INTO base_t VALUES (NULL, 1, 3), (1, NULL, 4), (NULL, NULL, 5);
+SELECT * FROM mv ORDER BY i, j;
+-- NULL and non-NULL keys in one delta, a new group with a NULL key
+INSERT INTO base_t VALUES (1, 1, 6), (NULL, NULL, 7), (2, NULL, 8);
+SELECT * FROM mv ORDER BY i, j;
+-- old and new delta without NULL keys
+UPDATE base_t SET v = v + 100 WHERE i = 1 AND j = 1;
+SELECT * FROM mv ORDER BY i, j;
+-- old delta without NULL keys, new delta with them
+UPDATE base_t SET i = NULL WHERE i = 1 AND j = 2;
+SELECT * FROM mv ORDER BY i, j;
+-- old delta with NULL keys, new delta without them
+UPDATE base_t SET j = 3 WHERE i IS NULL AND j IS NULL;
+SELECT * FROM mv ORDER BY i, j;
+-- groups removed
+DELETE FROM base_t WHERE i = 1 AND j = 1;
+DELETE FROM base_t WHERE j IS NULL;
+SELECT * FROM mv ORDER BY i, j;
+(SELECT i, j, sum(v) AS s, count(*) AS c FROM base_t GROUP BY i, j EXCEPT SELECT i, j, s, c FROM mv)
+UNION ALL
+(SELECT i, j, s, c FROM mv EXCEPT SELECT i, j, sum(v) AS s, count(*) AS c FROM base_t GROUP BY i, j);
+ROLLBACK;
+
+BEGIN;
+CREATE TABLE base_t (i int, j int, v int);
+INSERT INTO base_t VALUES (1, 1, 10), (1, 1, 20), (NULL, 1, 30), (NULL, 1, 40);
+SELECT pgivm.create_immv('mv', 'SELECT i, j, min(v), max(v) FROM base_t GROUP BY i, j');
+DELETE FROM base_t WHERE v IN (10, 30);
+SELECT * FROM mv ORDER BY i, j;
+DELETE FROM base_t WHERE v = 20;
+SELECT * FROM mv ORDER BY i, j;
+DELETE FROM base_t WHERE v = 40;
+SELECT * FROM mv ORDER BY i, j;
+ROLLBACK;
+
+BEGIN;
+CREATE TABLE base_t (i int, j int);
+INSERT INTO base_t VALUES (1, 1), (1, 1), (NULL, 1), (NULL, 1), (1, NULL);
+SELECT pgivm.create_immv('mv', 'SELECT i, j FROM base_t');
+DELETE FROM base_t WHERE ctid = (SELECT min(ctid) FROM base_t WHERE i = 1 AND j = 1);
+SELECT * FROM mv ORDER BY i, j;
+DELETE FROM base_t WHERE ctid = (SELECT min(ctid) FROM base_t WHERE i IS NULL);
+SELECT * FROM mv ORDER BY i, j;
+INSERT INTO base_t VALUES (1, 1), (NULL, NULL);
+DELETE FROM base_t WHERE j IS NULL;
+SELECT * FROM mv ORDER BY i, j;
+ROLLBACK;
+
+BEGIN;
+CREATE TABLE base_t (i int, j int);
+INSERT INTO base_t VALUES (1, 1), (1, 1), (NULL, 1), (NULL, 1);
+SELECT pgivm.create_immv('mv', 'SELECT DISTINCT i, j FROM base_t');
+DELETE FROM base_t WHERE ctid = (SELECT min(ctid) FROM base_t WHERE i = 1);
+SELECT * FROM mv ORDER BY i, j;
+DELETE FROM base_t WHERE ctid = (SELECT min(ctid) FROM base_t WHERE i IS NULL);
+SELECT * FROM mv ORDER BY i, j;
+INSERT INTO base_t VALUES (NULL, 1), (2, 2);
+DELETE FROM base_t WHERE i = 1;
+SELECT * FROM mv ORDER BY i, j;
+ROLLBACK;
+
 -- IMMV containing user defined type
 BEGIN;
 

@@ -252,18 +252,19 @@ static char *get_operation_string(IvmOp op, const char *col, const char *arg1, c
 static char *get_null_condition_string(IvmOp op, const char *arg1, const char *arg2,
 						  const char* count_col);
 static void apply_old_delta(const char *matviewname, const char *deltaname_old,
-				List *keys);
+				List *keys, Bitmapset *null_keys);
 static void apply_old_delta_with_count(const char *matviewname, const char *deltaname_old,
-				List *keys, StringInfo aggs_list, StringInfo aggs_set,
+				List *keys, Bitmapset *null_keys, StringInfo aggs_list, StringInfo aggs_set,
 				List *minmax_list, List *is_min_list,
 				const char *count_colname,
 				SPITupleTable **tuptable_recalc, uint64 *num_recalc);
 static void apply_new_delta(const char *matviewname, const char *deltaname_new,
 				StringInfo target_list);
 static void apply_new_delta_with_count(const char *matviewname, const char* deltaname_new,
-				List *keys, StringInfo target_list, StringInfo aggs_set,
+				List *keys, Bitmapset *null_keys, StringInfo target_list, StringInfo aggs_set,
 				const char* count_colname, bool distinct);
-static char *get_matching_condition_string(List *keys);
+static Bitmapset *get_delta_null_keys(Tuplestorestate *delta, TupleDesc tupdesc, List *keys);
+static char *get_matching_condition_string(List *keys, Bitmapset *null_keys);
 static char *get_returning_string(List *minmax_list, List *is_min_list, List *keys);
 static char *get_minmax_recalc_condition_string(List *minmax_list, List *is_min_list);
 static char *get_select_for_recalc_string(List *keys);
@@ -3007,6 +3008,8 @@ apply_delta(Oid matviewOid, Tuplestorestate *old_tuplestores, Tuplestorestate *n
 	ListCell	*lc;
 	int			i;
 	List	   *keys = NIL;
+	Bitmapset  *old_null_keys = NULL;
+	Bitmapset  *new_null_keys = NULL;
 	List	   *minmax_list = NIL;
 	List	   *is_min_list = NIL;
 
@@ -3146,14 +3149,17 @@ apply_delta(Oid matviewOid, Tuplestorestate *old_tuplestores, Tuplestorestate *n
 		if (rc != SPI_OK_REL_REGISTER)
 			elog(ERROR, "SPI_register failed");
 
+		/* find key columns that are NULL somewhere in the old delta */
+		old_null_keys = get_delta_null_keys(old_tuplestores, tupdesc_old, keys);
+
 		if (use_count)
 			/* apply old delta and get rows to be recalculated */
 			apply_old_delta_with_count(matviewname, OLD_DELTA_ENRNAME,
-									   keys, aggs_list_buf, aggs_set_old,
+									   keys, old_null_keys, aggs_list_buf, aggs_set_old,
 									   minmax_list, is_min_list,
 									   count_colname, &tuptable_recalc, &num_recalc);
 		else
-			apply_old_delta(matviewname, OLD_DELTA_ENRNAME, keys);
+			apply_old_delta(matviewname, OLD_DELTA_ENRNAME, keys, old_null_keys);
 
 		/*
 		 * If we have min or max, we might have to recalculate aggregate values from base tables
@@ -3193,10 +3199,13 @@ apply_delta(Oid matviewOid, Tuplestorestate *old_tuplestores, Tuplestorestate *n
 		if (rc != SPI_OK_REL_REGISTER)
 			elog(ERROR, "SPI_register failed");
 
+		/* find key columns that are NULL somewhere in the new delta */
+		new_null_keys = get_delta_null_keys(new_tuplestores, tupdesc_new, keys);
+
 		/* apply new delta */
 		if (use_count)
 			apply_new_delta_with_count(matviewname, NEW_DELTA_ENRNAME,
-								keys, &target_list_buf, aggs_set_new, count_colname,
+								keys, new_null_keys, &target_list_buf, aggs_set_new, count_colname,
 								query->distinctClause != NULL);
 		else
 			apply_new_delta(matviewname, NEW_DELTA_ENRNAME, &target_list_buf);
@@ -3556,7 +3565,7 @@ get_null_condition_string(IvmOp op, const char *arg1, const char *arg2,
  */
 static void
 apply_old_delta_with_count(const char *matviewname, const char *deltaname_old,
-				List *keys, StringInfo aggs_list, StringInfo aggs_set,
+				List *keys, Bitmapset *null_keys, StringInfo aggs_list, StringInfo aggs_set,
 				List *minmax_list, List *is_min_list,
 				const char *count_colname,
 				SPITupleTable **tuptable_recalc, uint64 *num_recalc)
@@ -3571,7 +3580,7 @@ apply_old_delta_with_count(const char *matviewname, const char *deltaname_old,
 	Assert(num_recalc != NULL);
 
 	/* build WHERE condition for searching tuples to be deleted */
-	match_cond = get_matching_condition_string(keys);
+	match_cond = get_matching_condition_string(keys, null_keys);
 
 	/*
 	 * We need a special RETURNING clause and SELECT statement for min/max to
@@ -3638,7 +3647,7 @@ apply_old_delta_with_count(const char *matviewname, const char *deltaname_old,
  */
 static void
 apply_old_delta(const char *matviewname, const char *deltaname_old,
-				List *keys)
+				List *keys, Bitmapset *null_keys)
 {
 	StringInfoData	querybuf;
 	StringInfoData	keysbuf;
@@ -3646,7 +3655,7 @@ apply_old_delta(const char *matviewname, const char *deltaname_old,
 	ListCell *lc;
 
 	/* build WHERE condition for searching tuples to be deleted */
-	match_cond = get_matching_condition_string(keys);
+	match_cond = get_matching_condition_string(keys, null_keys);
 
 	/* build string of keys list */
 	initStringInfo(&keysbuf);
@@ -3693,7 +3702,7 @@ apply_old_delta(const char *matviewname, const char *deltaname_old,
  */
 static void
 apply_new_delta_with_count(const char *matviewname, const char* deltaname_new,
-				List *keys, StringInfo target_list, StringInfo aggs_set,
+				List *keys, Bitmapset *null_keys, StringInfo target_list, StringInfo aggs_set,
 				const char* count_colname, bool distinct)
 {
 	StringInfoData	querybuf;
@@ -3704,7 +3713,7 @@ apply_new_delta_with_count(const char *matviewname, const char* deltaname_new,
 
 
 	/* build WHERE condition for searching tuples to be updated */
-	match_cond = get_matching_condition_string(keys);
+	match_cond = get_matching_condition_string(keys, null_keys);
 
 	/* build string of keys list */
 	initStringInfo(&returning_keys);
@@ -3792,15 +3801,91 @@ apply_new_delta(const char *matviewname, const char *deltaname_new,
 }
 
 /*
+ * get_delta_null_keys
+ *
+ * Return the positions in keys of the key columns that are NULL in at least
+ * one tuple of the delta.  A key column that can't be found in the delta is
+ * reported as NULL, so that the NULL-safe comparison is kept for it.
+ */
+static Bitmapset *
+get_delta_null_keys(Tuplestorestate *delta, TupleDesc tupdesc, List *keys)
+{
+	int			nkeys = list_length(keys);
+	AttrNumber *attnums;
+	Bitmapset  *null_keys = NULL;
+	TupleTableSlot *slot;
+	ListCell   *lc;
+	int			i;
+
+	if (nkeys == 0)
+		return NULL;
+
+	/* The delta has the same column names as the view. */
+	attnums = palloc(sizeof(AttrNumber) * nkeys);
+	i = 0;
+	foreach (lc, keys)
+	{
+		Form_pg_attribute key = (Form_pg_attribute) lfirst(lc);
+		int			j;
+
+		attnums[i] = InvalidAttrNumber;
+		for (j = 0; j < tupdesc->natts; j++)
+		{
+			Form_pg_attribute attr = TupleDescAttr(tupdesc, j);
+
+			if (!attr->attisdropped &&
+				strcmp(NameStr(attr->attname), NameStr(key->attname)) == 0)
+			{
+				attnums[i] = (AttrNumber) (j + 1);
+				break;
+			}
+		}
+		if (attnums[i] == InvalidAttrNumber)
+			null_keys = bms_add_member(null_keys, i);
+		i++;
+	}
+
+	/*
+	 * Scan the delta with the first read pointer.  Named tuplestore scans in
+	 * the maintenance queries use read pointers of their own and rewind them,
+	 * so this doesn't affect them.
+	 */
+	slot = MakeSingleTupleTableSlot(tupdesc, &TTSOpsMinimalTuple);
+	tuplestore_select_read_pointer(delta, 0);
+	tuplestore_rescan(delta);
+	while (bms_num_members(null_keys) < nkeys &&
+		   tuplestore_gettupleslot(delta, true, false, slot))
+	{
+		for (i = 0; i < nkeys; i++)
+		{
+			if (!bms_is_member(i, null_keys) && slot_attisnull(slot, attnums[i]))
+				null_keys = bms_add_member(null_keys, i);
+		}
+	}
+	ExecDropSingleTupleTableSlot(slot);
+	tuplestore_rescan(delta);
+	pfree(attnums);
+
+	return null_keys;
+}
+
+/*
  * get_matching_condition_string
  *
  * Build a predicate string for looking for a tuple with given keys.
+ *
+ * null_keys has the positions in keys of the key columns that are NULL in
+ * some tuple of the delta.  Only these need the NULL-safe comparison: when a
+ * column is never NULL in the delta, (mv.k IS NULL AND diff.k IS NULL) is
+ * false for every delta tuple, and a plain equality lets the planner use an
+ * index on all the key columns.
  */
 static char *
-get_matching_condition_string(List *keys)
+get_matching_condition_string(List *keys, Bitmapset *null_keys)
 {
 	StringInfoData match_cond;
 	ListCell	*lc;
+	int			i = 0;
 
 	/* If there is no key columns, the condition is always true. */
 	if (keys == NIL)
@@ -3815,14 +3900,20 @@ get_matching_condition_string(List *keys)
 		char   *diff_resname = quote_qualified_identifier("diff", resname);
 		Oid		typid = attr->atttypid;
 
-		/* Considering NULL values, we can not use simple = operator. */
-		appendStringInfo(&match_cond, "(");
-		generate_equal(&match_cond, typid, mv_resname, diff_resname);
-		appendStringInfo(&match_cond, " OR (%s IS NULL AND %s IS NULL))",
-						 mv_resname, diff_resname);
+		if (bms_is_member(i, null_keys))
+		{
+			/* Considering NULL values, we can not use simple = operator. */
+			appendStringInfo(&match_cond, "(");
+			generate_equal(&match_cond, typid, mv_resname, diff_resname);
+			appendStringInfo(&match_cond, " OR (%s IS NULL AND %s IS NULL))",
+							 mv_resname, diff_resname);
+		}
+		else
+			generate_equal(&match_cond, typid, mv_resname, diff_resname);
 
 		if (lnext(keys, lc))
 			appendStringInfo(&match_cond, " AND ");
+		i++;
 	}
 
 	return match_cond.data;
